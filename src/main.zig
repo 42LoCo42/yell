@@ -82,7 +82,13 @@ pub fn main() !u8 {
         } else {
             // client or stdin
             var buf: [1024]u8 = undefined;
-            const len = try std.os.read(fd, &buf);
+            const len = std.os.read(fd, &buf) catch |err| {
+                msgErr("{d}: read failed: {s}\n", .{fd, err});
+                _ = connections.remove(fd);
+                epollDel(epoll_fd, fd);
+                std.os.closeSocket(fd);
+                continue;
+            };
 
             if(len == 0) {
                 msgErr("{d}: disconnected\n", .{fd});
