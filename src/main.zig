@@ -29,6 +29,12 @@ fn epollDel(epoll_fd: i32, fd: i32) void {
     std.os.epoll_ctl(epoll_fd, std.os.EPOLL_CTL_DEL, fd, null) catch unreachable;
 }
 
+fn usage() void {
+    msgOut("Usage: {s} <ip> <port>\n", .{
+        std.os.argv[0],
+    });
+}
+
 pub fn main() !u8 {
     if (std.os.argv.len < 3) {
         usage();
@@ -37,8 +43,6 @@ pub fn main() !u8 {
 
     const port = try std.fmt.parseUnsigned(u16, std.os.argv[2][0..lenOfSTP(std.os.argv[2])], 0);
     const addr = try std.net.Address.resolveIp(std.os.argv[1][0..lenOfSTP(std.os.argv[1])], port);
-
-    msgErr("Listening on {s}\n", .{addr});
 
     var server = std.net.StreamServer.init(.{ .kernel_backlog = 5, .reuse_address = true });
     defer server.deinit();
@@ -52,13 +56,27 @@ pub fn main() !u8 {
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
-    const alloc = &gpa.allocator;
-    var connections = std.AutoHashMap(std.os.socket_t, std.net.StreamServer.Connection).init(alloc);
+    const Connections = std.AutoHashMap(std.os.socket_t, std.net.StreamServer.Connection);
+    var connections = Connections.init(&gpa.allocator);
 
     // append stdout as fake connection
     var stdout_conn = std.mem.zeroes(std.net.StreamServer.Connection);
     stdout_conn.stream.handle = stdout_handle;
     try connections.put(stdout_handle, stdout_conn);
+
+    // this lambda closes a connection completely
+    const closeConn = (struct {
+        epoll_fd: i32,
+        connections: *Connections,
+        fn closeConn(self: *@This(), fd: std.os.socket_t) void {
+            _ = self.connections.remove(fd);
+            epollDel(self.epoll_fd, fd);
+            std.os.closeSocket(fd);
+        }
+    }{ .epoll_fd = epoll_fd, .connections = &connections }).closeConn;
+    _ = closeConn;
+
+    msgErr("Listening on {s}\n", .{addr});
 
     while (true) {
         var events: [1]std.os.epoll_event = undefined;
@@ -66,54 +84,46 @@ pub fn main() !u8 {
         _ = std.os.epoll_wait(epoll_fd, &events, -1);
         const fd = event.data.fd;
 
-        if(fd == listener) {
+        if (fd == listener) {
             const new = server.accept() catch |err| {
                 msgErr("S: could not accept client: {s}\n", .{err});
                 continue;
             };
             epollAdd(epoll_fd, new.stream.handle) catch |err| {
-                msgErr("S: could not add {d} to epoll: {s}\n", .{new.stream.handle, err});
+                msgErr("S: could not add {d} to epoll: {s}\n", .{ new.stream.handle, err });
                 std.os.closeSocket(new.stream.handle);
                 continue;
             };
             connections.put(new.stream.handle, new) catch |err| {
-                msgErr("S: could not register {d}: {s}\n", .{new.stream.handle, err});
+                msgErr("S: could not register {d}: {s}\n", .{ new.stream.handle, err });
             };
+            msgErr("S: accepted {d} = {s}\n", .{ new.stream.handle, new.address });
         } else {
             // client or stdin
             var buf: [1024]u8 = undefined;
             const len = std.os.read(fd, &buf) catch |err| {
-                msgErr("{d}: read failed: {s}\n", .{fd, err});
-                _ = connections.remove(fd);
-                epollDel(epoll_fd, fd);
-                std.os.closeSocket(fd);
+                msgErr("{d}: read failed: {s}\n", .{ fd, err });
+                closeConn(fd);
                 continue;
             };
 
-            if(len == 0) {
+            if (len == 0) {
                 msgErr("{d}: disconnected\n", .{fd});
-                _ = connections.remove(fd);
-                epollDel(epoll_fd, fd);
-                std.os.closeSocket(fd);
+                closeConn(fd);
                 continue;
             }
 
             var it = connections.iterator();
-            while(it.next()) |ent| {
-                if(ent.key_ptr.* == fd) continue; // don't write to myself
-                if(ent.key_ptr.* == stdout_handle and fd == stdin_handle) continue; // no serverside passthrough
+            while (it.next()) |ent| {
+                if (ent.key_ptr.* == fd) continue; // don't write to myself
+                if (ent.key_ptr.* == stdout_handle and fd == stdin_handle) continue; // no serverside passthrough
                 _ = ent.value_ptr.stream.write(buf[0..len]) catch |err| {
-                    msgErr("{d}: could not write buffer: {s}\n", .{ent.key_ptr.*, err});
+                    msgErr("{d}: could not write buffer: {s}\n", .{ ent.key_ptr.*, err });
+                    closeConn(ent.key_ptr.*);
                     continue;
                 };
             }
         }
     }
     return 0;
-}
-
-fn usage() void {
-    msgOut("Usage: {s} <ip> <port>\n", .{
-        std.os.argv[0],
-    });
 }
