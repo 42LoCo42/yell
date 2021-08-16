@@ -6,18 +6,18 @@ const writer_err = std.io.getStdErr().writer();
 const stdin_handle = std.io.getStdIn().handle;
 const stdout_handle = std.io.getStdOut().handle;
 
+fn slice(ptr: anytype) []@typeInfo(@TypeOf(ptr)).Pointer.child {
+    var len: usize = 0;
+    while (ptr[len] != 0) : (len += 1) {}
+    return ptr[0..len];
+}
+
 fn msgOut(comptime fmt: []const u8, args: anytype) void {
     writer_out.print(fmt, args) catch |err| std.debug.print("{s}\n", .{err});
 }
 
 fn msgErr(comptime fmt: []const u8, args: anytype) void {
     writer_err.print(fmt, args) catch |err| std.debug.print("{s}\n", .{err});
-}
-
-fn lenOfSTP(ptr: anytype) usize {
-    var len: usize = 0;
-    while (ptr[len] != 0) : (len += 1) {}
-    return len;
 }
 
 fn epollAdd(epoll_fd: i32, fd: i32) !void {
@@ -30,7 +30,7 @@ fn epollDel(epoll_fd: i32, fd: i32) void {
 }
 
 fn usage() void {
-    msgOut("Usage: {s} <ip> <port>\n", .{
+    msgOut("Usage: {s} <ip> <port> [-r: relay client messages to other clients]\n", .{
         std.os.argv[0],
     });
 }
@@ -41,8 +41,9 @@ pub fn main() !u8 {
         return 1;
     }
 
-    const port = try std.fmt.parseUnsigned(u16, std.os.argv[2][0..lenOfSTP(std.os.argv[2])], 0);
-    const addr = try std.net.Address.resolveIp(std.os.argv[1][0..lenOfSTP(std.os.argv[1])], port);
+    const port = try std.fmt.parseUnsigned(u16, slice(std.os.argv[2]), 0);
+    const addr = try std.net.Address.resolveIp(slice(std.os.argv[1]), port);
+    const relay = std.os.argv.len >= 4 and std.mem.eql(u8, slice(std.os.argv[3]), "-r");
 
     var server = std.net.StreamServer.init(.{ .kernel_backlog = 5, .reuse_address = true });
     defer server.deinit();
@@ -59,24 +60,31 @@ pub fn main() !u8 {
     const Connections = std.AutoHashMap(std.os.socket_t, std.net.StreamServer.Connection);
     var connections = Connections.init(&gpa.allocator);
 
-    // append stdout as fake connection
     var stdout_conn = std.mem.zeroes(std.net.StreamServer.Connection);
     stdout_conn.stream.handle = stdout_handle;
-    try connections.put(stdout_handle, stdout_conn);
 
     // this lambda closes a connection completely
-    const closeConn = (struct {
+    var lambda = struct {
         epoll_fd: i32,
         connections: *Connections,
+
         fn closeConn(self: *@This(), fd: std.os.socket_t) void {
             _ = self.connections.remove(fd);
             epollDel(self.epoll_fd, fd);
             std.os.closeSocket(fd);
         }
-    }{ .epoll_fd = epoll_fd, .connections = &connections }).closeConn;
-    _ = closeConn;
 
-    msgErr("Listening on {s}\n", .{addr});
+        fn send(self: *@This(), msg: []const u8, conn: *std.net.StreamServer.Connection) void {
+            _ = conn.stream.write(msg) catch |err| {
+                msgErr("{d}: could not write buffer: {s}\n", .{conn.stream.handle, err});
+                self.closeConn(conn.stream.handle);
+            };
+        }
+    }{ .epoll_fd = epoll_fd, .connections = &connections };
+    const closeConn = lambda.closeConn;
+    const send = lambda.send;
+
+    msgErr("Listening on {s}, relay: {b}\n", .{addr, relay});
 
     while (true) {
         var events: [1]std.os.epoll_event = undefined;
@@ -113,15 +121,17 @@ pub fn main() !u8 {
                 continue;
             }
 
-            var it = connections.iterator();
+            // send to stdout if from client
+            if (fd != stdin_handle) {
+                send(buf[0..len], &stdout_conn);
+                if (!relay) continue;
+            }
+
+            // send to clients
+            var it = connections.valueIterator();
             while (it.next()) |ent| {
-                if (ent.key_ptr.* == fd) continue; // don't write to myself
-                if (ent.key_ptr.* == stdout_handle and fd == stdin_handle) continue; // no serverside passthrough
-                _ = ent.value_ptr.stream.write(buf[0..len]) catch |err| {
-                    msgErr("{d}: could not write buffer: {s}\n", .{ ent.key_ptr.*, err });
-                    closeConn(ent.key_ptr.*);
-                    continue;
-                };
+                if (ent.stream.handle == fd) continue;
+                send(buf[0..len], ent);
             }
         }
     }
