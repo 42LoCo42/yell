@@ -21,12 +21,12 @@ fn lenOfSTP(ptr: anytype) usize {
 }
 
 fn epollAdd(epoll_fd: i32, fd: i32) !void {
-    var event: std.os.epoll_event = .{ .events = std.os.EPOLLIN, .data = .{ .fd = fd } };
-    try std.os.epoll_ctl(epoll_fd, std.os.EPOLL_CTL_ADD, fd, &event);
+    var event: std.os.linux.epoll_event = .{ .events = std.os.linux.EPOLL.IN, .data = .{ .fd = fd } };
+    try std.os.epoll_ctl(epoll_fd, std.os.linux.EPOLL.CTL_ADD, fd, &event);
 }
 
 fn epollDel(epoll_fd: i32, fd: i32) void {
-    std.os.epoll_ctl(epoll_fd, std.os.EPOLL_CTL_DEL, fd, null) catch unreachable;
+    std.os.epoll_ctl(epoll_fd, std.os.linux.EPOLL.CTL_DEL, fd, null) catch unreachable;
 }
 
 fn usage() void {
@@ -79,7 +79,7 @@ pub fn main() !u8 {
     msgErr("Listening on {s}\n", .{addr});
 
     while (true) {
-        var events: [1]std.os.epoll_event = undefined;
+        var events: [1]std.os.linux.epoll_event = undefined;
         var event = &events[0];
         _ = std.os.epoll_wait(epoll_fd, &events, -1);
         const fd = event.data.fd;
